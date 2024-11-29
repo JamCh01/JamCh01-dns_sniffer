@@ -12,17 +12,12 @@ use std::{
     time::{Duration, SystemTime, UNIX_EPOCH},
 };
 use structopt::StructOpt;
-use tokio::{
-    sync::{mpsc, Mutex},
-    time::sleep,
-};
-use tokio_amqp::LapinTokioExt;
-use trust_dns_proto::{
-    op::{Message, MessageType},
-    rr::{RData, RecordType},
-};
+use tokio::sync::{mpsc, Mutex};
+use trust_dns_proto::op::{Message, MessageType};
+use trust_dns_proto::rr::{RData, RecordType};
 
 const CHANNEL_SIZE: usize = 10000;
+const PACKET_CHANNEL_SIZE: usize = 10000;
 const RECONNECT_DELAY: Duration = Duration::from_secs(5);
 const RETRY_ATTEMPTS: u32 = 3;
 
@@ -63,14 +58,8 @@ impl ConnectionManager {
     async fn get_connection(&mut self) -> LapinResult<&Connection> {
         if self.conn.is_none() {
             self.conn = Some(
-                Connection::connect(
-                    &self.url,
-                    ConnectionProperties::default()
-                        .with_tokio()
-                        .with_connection_name("dns_sniffer".into())
-                        .with_heartbeat(Duration::from_secs(30)),
-                )
-                .await?,
+                Connection::connect(&self.url, ConnectionProperties::default())
+                    .await?,
             );
             self.reconnect_attempts = 0;
             println!("Successfully connected to RabbitMQ");
@@ -81,11 +70,8 @@ impl ConnectionManager {
     async fn reconnect(&mut self) -> LapinResult<&Connection> {
         self.conn = None;
         self.reconnect_attempts += 1;
-        println!(
-            "Attempting to reconnect (attempt {})",
-            self.reconnect_attempts
-        );
-        sleep(RECONNECT_DELAY).await;
+        println!("Attempting to reconnect (attempt {})", self.reconnect_attempts);
+        tokio::time::sleep(RECONNECT_DELAY).await;
         self.get_connection().await
     }
 }
@@ -134,24 +120,48 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     });
 
     let interface = setup_interface(&opt.ifname).await?;
-    let (_tx, mut rx) = match datalink::channel(&interface, Default::default()) {
+    let (_, mut rx) = match datalink::channel(&interface, Default::default()) {
         Ok(datalink::Channel::Ethernet(tx, rx)) => (tx, rx),
         Ok(_) => return Err("Unhandled channel type".into()),
         Err(e) => return Err(format!("Error creating datalink channel: {}", e).into()),
     };
 
-    let tx = Arc::new(Mutex::new(tx));
+    let (packet_tx, packet_rx) = mpsc::channel(PACKET_CHANNEL_SIZE);
+    let packet_rx = Arc::new(Mutex::new(packet_rx));
+
+    let packet_handle = std::thread::spawn(move || {
+        while let Ok(packet) = rx.next() {
+            if let Err(e) = packet_tx.blocking_send(packet.to_vec()) {
+                eprintln!("Failed to send packet: {}", e);
+                break;
+            }
+        }
+    });
+
     let num_threads = num_cpus::get();
     println!("Starting {} packet processing threads", num_threads);
 
+    let msg_sender = Arc::new(Mutex::new(tx));
     let mut handles = vec![];
+
     for thread_id in 0..num_threads {
-        let tx_clone = tx.clone();
+        let packet_rx = Arc::clone(&packet_rx);
+        let tx = Arc::clone(&msg_sender);
+        
         let handle = tokio::spawn(async move {
             println!("Started packet processing thread {}", thread_id);
-            while let Ok(packet) = rx.next() {
-                if let Some(ethernet_packet) = EthernetPacket::new(packet) {
-                    handle_ethernet_packet(&ethernet_packet, &tx_clone).await;
+            
+            loop {
+                let packet = {
+                    let mut rx = packet_rx.lock().await;
+                    match rx.recv().await {
+                        Some(packet) => packet,
+                        None => break,
+                    }
+                };
+
+                if let Some(ethernet_packet) = EthernetPacket::new(&packet) {
+                    handle_ethernet_packet(&ethernet_packet, &tx).await;
                 }
             }
         });
@@ -160,6 +170,10 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     for handle in handles {
         handle.await?;
+    }
+    
+    if let Err(e) = packet_handle.join() {
+        eprintln!("Packet receiver thread panicked: {:?}", e);
     }
     consumer_handle.await?;
 
@@ -175,13 +189,19 @@ async fn handle_ethernet_packet<'a>(
     }
 }
 
-async fn handle_ipv4_packet<'a>(ipv4: &'a Ipv4Packet<'a>, tx: &Arc<Mutex<mpsc::Sender<String>>>) {
+async fn handle_ipv4_packet<'a>(
+    ipv4: &'a Ipv4Packet<'a>,
+    tx: &Arc<Mutex<mpsc::Sender<String>>>,
+) {
     if let Some(udp_packet) = UdpPacket::new(ipv4.payload()) {
         handle_udp_packet(&udp_packet, tx).await;
     }
 }
 
-async fn handle_udp_packet<'a>(udp: &'a UdpPacket<'a>, tx: &Arc<Mutex<mpsc::Sender<String>>>) {
+async fn handle_udp_packet<'a>(
+    udp: &'a UdpPacket<'a>,
+    tx: &Arc<Mutex<mpsc::Sender<String>>>,
+) {
     if udp.get_source() != 53 {
         return;
     }
@@ -196,7 +216,7 @@ async fn handle_udp_packet<'a>(udp: &'a UdpPacket<'a>, tx: &Arc<Mutex<mpsc::Send
         for answer in message.answers() {
             let record = match answer.record_type() {
                 RecordType::A => {
-                    let q = process_domain(answer.name().as_str());
+                    let q = process_domain(&answer.name().to_string());
                     if let Some(RData::A(ip)) = answer.data() {
                         Some(DnsRecord {
                             q,
@@ -209,7 +229,7 @@ async fn handle_udp_packet<'a>(udp: &'a UdpPacket<'a>, tx: &Arc<Mutex<mpsc::Send
                     }
                 }
                 RecordType::AAAA => {
-                    let q = process_domain(answer.name().as_str());
+                    let q = process_domain(&answer.name().to_string());
                     if let Some(RData::AAAA(ip)) = answer.data() {
                         Some(DnsRecord {
                             q,
@@ -222,7 +242,7 @@ async fn handle_udp_packet<'a>(udp: &'a UdpPacket<'a>, tx: &Arc<Mutex<mpsc::Send
                     }
                 }
                 RecordType::CNAME => {
-                    let q = process_domain(answer.name().as_str());
+                    let q = process_domain(&answer.name().to_string());
                     if let Some(RData::CNAME(name)) = answer.data() {
                         let a = name.to_string();
                         Some(DnsRecord {

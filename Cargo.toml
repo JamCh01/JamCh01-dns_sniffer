@@ -1,5 +1,5 @@
 [package]
-name = "rust_tmp"
+name = "lowenddns_sniffer"
 version = "0.2.0"
 edition = "2021"
 
