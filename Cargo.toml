@@ -17,3 +17,13 @@ tokio-reactor-trait = "1.1.0"
 trust-dns-proto = "0.23.2"
 num_cpus = "1.16.0"
 serde_json = "1.0.133"
+
+
+[profile.release]
+opt-level = 3  # 使用最高优化级别
+lto = true  # 启用链接时优化
+panic = "abort"  # 禁用栈展开
+target-cpu = "native"  # 针对当前 CPU 进行优化
+debuginfo = 0  # 不生成调试信息
+codegen-units = 1  # 启用跨模块优化
+incremental = false  # 关闭增量编译
