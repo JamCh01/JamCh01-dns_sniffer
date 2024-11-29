@@ -1,12 +1,30 @@
-use lapin::{options::*, types::FieldTable, BasicProperties, Connection, ConnectionProperties};
-use pnet::datalink::{self};
+use idna;
+use lapin::{
+    options::*, types::FieldTable, BasicProperties, Connection, ConnectionProperties,
+    Result as LapinResult,
+};
+use pnet::datalink::{self, NetworkInterface};
 use pnet::packet::{ethernet::EthernetPacket, ipv4::Ipv4Packet, udp::UdpPacket, Packet};
 use serde::{Deserialize, Serialize};
+use std::{
+    net::IpAddr,
+    sync::Arc,
+    time::{Duration, SystemTime, UNIX_EPOCH},
+};
 use structopt::StructOpt;
-use tokio::sync::mpsc;
+use tokio::{
+    sync::{mpsc, Mutex},
+    time::sleep,
+};
 use tokio_amqp::LapinTokioExt;
-use trust_dns_proto::op::{Message, MessageType};
-use trust_dns_proto::rr::{RData, RecordType};
+use trust_dns_proto::{
+    op::{Message, MessageType},
+    rr::{RData, RecordType},
+};
+
+const CHANNEL_SIZE: usize = 10000;
+const RECONNECT_DELAY: Duration = Duration::from_secs(5);
+const RETRY_ATTEMPTS: u32 = 3;
 
 #[derive(StructOpt, Debug)]
 #[structopt(name = "dns_sniffer")]
@@ -19,156 +37,275 @@ struct Opt {
     queue_name: String,
 }
 
-#[derive(Serialize, Deserialize)]
+#[derive(Serialize, Deserialize, Debug, Clone)]
 struct DnsRecord {
     q: String,
     t: i32,
     a: String,
+    created_at: u64,
 }
 
-fn remove_trailing_dot(s: String) -> String {
-    if s.ends_with('.') {
-        s.trim_end_matches('.').to_string()
-    } else {
-        s.to_string()
+struct ConnectionManager {
+    conn: Option<Connection>,
+    url: String,
+    reconnect_attempts: u32,
+}
+
+impl ConnectionManager {
+    fn new(url: String) -> Self {
+        Self {
+            conn: None,
+            url,
+            reconnect_attempts: 0,
+        }
     }
+
+    async fn get_connection(&mut self) -> LapinResult<&Connection> {
+        if self.conn.is_none() {
+            self.conn = Some(
+                Connection::connect(
+                    &self.url,
+                    ConnectionProperties::default()
+                        .with_tokio()
+                        .with_connection_name("dns_sniffer".into())
+                        .with_heartbeat(Duration::from_secs(30)),
+                )
+                .await?,
+            );
+            self.reconnect_attempts = 0;
+            println!("Successfully connected to RabbitMQ");
+        }
+        Ok(self.conn.as_ref().unwrap())
+    }
+
+    async fn reconnect(&mut self) -> LapinResult<&Connection> {
+        self.conn = None;
+        self.reconnect_attempts += 1;
+        println!(
+            "Attempting to reconnect (attempt {})",
+            self.reconnect_attempts
+        );
+        sleep(RECONNECT_DELAY).await;
+        self.get_connection().await
+    }
+}
+
+#[inline]
+fn process_domain(domain: &str) -> String {
+    let domain = domain.trim_end_matches('.');
+    idna::domain_to_ascii(domain).unwrap_or_else(|_| domain.to_string())
+}
+
+#[inline]
+fn is_ip_address(s: &str) -> bool {
+    s.parse::<IpAddr>().is_ok()
+}
+
+#[inline]
+fn get_current_timestamp() -> u64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_secs()
+}
+
+async fn setup_interface(ifname: &str) -> Result<NetworkInterface, Box<dyn std::error::Error>> {
+    datalink::interfaces()
+        .into_iter()
+        .find(|iface| iface.name == ifname)
+        .ok_or_else(|| "Network interface not found".into())
 }
 
 #[tokio::main]
-async fn main() {
+async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let opt = Opt::from_args();
-    let (tx, mut rx) = mpsc::channel(100);
+    let (tx, rx) = mpsc::channel(CHANNEL_SIZE);
     let amqp_url = opt.amqp_url.clone();
     let queue_name = opt.queue_name.clone();
-    tokio::spawn(async move {
-        consume_records(&mut rx, &amqp_url, &queue_name).await;
+
+    println!("Starting DNS sniffer...");
+    println!("Interface: {}", opt.ifname);
+    println!("Queue: {}", queue_name);
+
+    let consumer_handle = tokio::spawn(async move {
+        if let Err(e) = consume_records(rx, &amqp_url, &queue_name).await {
+            eprintln!("Error in consume_records: {}", e);
+        }
     });
 
-    let interfaces = datalink::interfaces();
-
-    let interface_name = opt.ifname;
-    let interface = interfaces
-        .into_iter()
-        .find(|iface| iface.name == interface_name)
-        .expect("Network interface not found");
-
-    let (_, mut rx) = match datalink::channel(&interface, Default::default()) {
+    let interface = setup_interface(&opt.ifname).await?;
+    let (_tx, mut rx) = match datalink::channel(&interface, Default::default()) {
         Ok(datalink::Channel::Ethernet(tx, rx)) => (tx, rx),
-        Ok(_) => panic!("Unhandled channel type"),
-        Err(e) => panic!(
-            "An error occurred when creating the datalink channel: {}",
-            e
-        ),
+        Ok(_) => return Err("Unhandled channel type".into()),
+        Err(e) => return Err(format!("Error creating datalink channel: {}", e).into()),
     };
 
-    loop {
-        match rx.next() {
-            Ok(packet) => {
+    let tx = Arc::new(Mutex::new(tx));
+    let num_threads = num_cpus::get();
+    println!("Starting {} packet processing threads", num_threads);
+
+    let mut handles = vec![];
+    for thread_id in 0..num_threads {
+        let tx_clone = tx.clone();
+        let handle = tokio::spawn(async move {
+            println!("Started packet processing thread {}", thread_id);
+            while let Ok(packet) = rx.next() {
                 if let Some(ethernet_packet) = EthernetPacket::new(packet) {
-                    handle_ethernet_packet(&ethernet_packet, &tx).await;
+                    handle_ethernet_packet(&ethernet_packet, &tx_clone).await;
                 }
             }
-            Err(e) => {
-                eprintln!("An error occurred while reading: {}", e);
-            }
-        }
+        });
+        handles.push(handle);
     }
+
+    for handle in handles {
+        handle.await?;
+    }
+    consumer_handle.await?;
+
+    Ok(())
 }
 
-async fn handle_ethernet_packet<'a>(ethernet: &'a EthernetPacket<'a>, tx: &mpsc::Sender<String>) {
+async fn handle_ethernet_packet<'a>(
+    ethernet: &'a EthernetPacket<'a>,
+    tx: &Arc<Mutex<mpsc::Sender<String>>>,
+) {
     if let Some(ipv4_packet) = Ipv4Packet::new(ethernet.payload()) {
         handle_ipv4_packet(&ipv4_packet, tx).await;
     }
 }
 
-async fn handle_ipv4_packet<'a>(ipv4: &'a Ipv4Packet<'a>, tx: &mpsc::Sender<String>) {
+async fn handle_ipv4_packet<'a>(ipv4: &'a Ipv4Packet<'a>, tx: &Arc<Mutex<mpsc::Sender<String>>>) {
     if let Some(udp_packet) = UdpPacket::new(ipv4.payload()) {
         handle_udp_packet(&udp_packet, tx).await;
     }
 }
 
-async fn handle_udp_packet<'a>(udp: &'a UdpPacket<'a>, tx: &mpsc::Sender<String>) {
-    if udp.get_source() == 53 {
-        if let Ok(message) = Message::from_vec(udp.payload()) {
-            if message.header().message_type() == MessageType::Response {
-                for answer in message.answers() {
-                    let mut q = "".to_string();
-                    let mut t = 1;
-                    let mut a = "".to_string();
-                    let _record = match answer.record_type() {
-                        RecordType::A => {
-                            q = remove_trailing_dot(answer.name().to_string());
-                            t = 1;
-                            a = if let Some(RData::A(ip)) = answer.data() {
-                                ip.to_string()
-                            } else {
-                                "".to_string()
-                            };
-                        }
-                        RecordType::AAAA => {
-                            q = remove_trailing_dot(answer.name().to_string());
-                            t = 28;
-                            a = if let Some(RData::AAAA(ip)) = answer.data() {
-                                ip.to_string()
-                            } else {
-                                "".to_string()
-                            };
-                        }
-                        RecordType::CNAME => {
-                            q = remove_trailing_dot(answer.name().to_string());
-                            t = 5;
-                            a = if let Some(RData::CNAME(name)) = answer.data() {
-                                remove_trailing_dot(name.to_string())
-                            } else {
-                                "".to_string()
-                            };
-                        }
-                        _ => continue,
-                    };
+async fn handle_udp_packet<'a>(udp: &'a UdpPacket<'a>, tx: &Arc<Mutex<mpsc::Sender<String>>>) {
+    if udp.get_source() != 53 {
+        return;
+    }
 
-                    let dns_record = DnsRecord { q: q, t: t, a: a };
+    if let Ok(message) = Message::from_vec(udp.payload()) {
+        if message.header().message_type() != MessageType::Response {
+            return;
+        }
 
-                    let data =
-                        serde_json::to_string(&dns_record).expect("Failed to serialize record");
-                    tx.send(data).await.expect("Failed to send record");
+        let timestamp = get_current_timestamp();
+
+        for answer in message.answers() {
+            let record = match answer.record_type() {
+                RecordType::A => {
+                    let q = process_domain(answer.name().as_str());
+                    if let Some(RData::A(ip)) = answer.data() {
+                        Some(DnsRecord {
+                            q,
+                            t: 1,
+                            a: ip.to_string(),
+                            created_at: timestamp,
+                        })
+                    } else {
+                        None
+                    }
+                }
+                RecordType::AAAA => {
+                    let q = process_domain(answer.name().as_str());
+                    if let Some(RData::AAAA(ip)) = answer.data() {
+                        Some(DnsRecord {
+                            q,
+                            t: 28,
+                            a: ip.to_string(),
+                            created_at: timestamp,
+                        })
+                    } else {
+                        None
+                    }
+                }
+                RecordType::CNAME => {
+                    let q = process_domain(answer.name().as_str());
+                    if let Some(RData::CNAME(name)) = answer.data() {
+                        let a = name.to_string();
+                        Some(DnsRecord {
+                            q,
+                            t: 5,
+                            a: if !is_ip_address(&a) {
+                                process_domain(&a)
+                            } else {
+                                a
+                            },
+                            created_at: timestamp,
+                        })
+                    } else {
+                        None
+                    }
+                }
+                _ => None,
+            };
+
+            if let Some(record) = record {
+                if let Ok(data) = serde_json::to_string(&record) {
+                    let tx = tx.lock().await;
+                    if let Err(e) = tx.send(data.clone()).await {
+                        eprintln!("Failed to send record: {}", e);
+                    }
                 }
             }
         }
     }
 }
 
-async fn consume_records(rx: &mut mpsc::Receiver<String>, amqp_url: &str, queue_name: &str) {
-    // 连接到 RabbitMQ
-    let conn = Connection::connect(amqp_url, ConnectionProperties::default().with_tokio())
-        .await
-        .expect("Failed to connect to RabbitMQ");
-    let channel = conn
-        .create_channel()
-        .await
-        .expect("Failed to create channel");
+async fn consume_records(
+    mut rx: mpsc::Receiver<String>,
+    amqp_url: &str,
+    queue_name: &str,
+) -> Result<(), Box<dyn std::error::Error>> {
+    let mut conn_manager = ConnectionManager::new(amqp_url.to_string());
 
-    // 声明队列
-    channel
-        .queue_declare(
-            queue_name,
-            QueueDeclareOptions::default(),
-            FieldTable::default(),
-        )
-        .await
-        .expect("Failed to declare queue");
+    loop {
+        let conn = match conn_manager.get_connection().await {
+            Ok(conn) => conn,
+            Err(e) => {
+                eprintln!("Failed to get connection: {}", e);
+                if conn_manager.reconnect_attempts >= RETRY_ATTEMPTS {
+                    return Err("Max reconnection attempts reached".into());
+                }
+                conn_manager.reconnect().await?;
+                continue;
+            }
+        };
 
-    // 消费记录
-    while let Some(record) = rx.recv().await {
+        let channel = conn.create_channel().await?;
+
         channel
-            .basic_publish(
-                "",
+            .queue_declare(
                 queue_name,
-                BasicPublishOptions::default(),
-                record.as_bytes(),
-                BasicProperties::default(),
+                QueueDeclareOptions::default(),
+                FieldTable::default(),
             )
-            .await
-            .expect("Failed to publish message");
-        println!("Published message: {}", record);
+            .await?;
+
+        println!("Ready to process DNS records");
+
+        while let Some(record) = rx.recv().await {
+            match channel
+                .basic_publish(
+                    "",
+                    queue_name,
+                    BasicPublishOptions::default(),
+                    record.as_bytes(),
+                    BasicProperties::default(),
+                )
+                .await
+            {
+                Ok(_) => {
+                    println!("Published record: {}", record);
+                }
+                Err(e) => {
+                    eprintln!("Failed to publish record: {}", e);
+                    conn_manager.reconnect().await?;
+                    break;
+                }
+            }
+        }
     }
 }
